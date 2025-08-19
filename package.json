@@ -1,6 +1,6 @@
 {
   "name": "azurecq",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Azure Cheap Queues is a High-performance queue system based on Redis and Azure Storage with message durability guarantees",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
