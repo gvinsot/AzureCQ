@@ -11,8 +11,9 @@ async function acknowledgmentTimeoutExample(): Promise<void> {
   const config: QueueConfiguration = {
     name: 'timeout-test',
     redis: {
-      host: 'localhost',
-      port: 6379,
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      password: process.env.REDIS_PASSWORD,
       keyPrefix: 'timeout:'
     },
     azure: {
@@ -271,7 +272,7 @@ async function timeoutBestPracticesExample(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'best-practices',
-    redis: { host: 'localhost', port: 6379, keyPrefix: 'best:' },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD, keyPrefix: 'best:' },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'best-practices',

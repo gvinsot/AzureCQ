@@ -177,7 +177,11 @@ export class RedisManager {
   async connect(): Promise<void> {
     return this.performanceMonitor.time('connect', async () => {
       this.shouldReconnect = true;
-      await this.redis.connect();
+      const status = (this.redis as any).status as string | undefined;
+      const needsConnect = !status || status === 'wait' || status === 'end';
+      if (needsConnect) {
+        await this.redis.connect();
+      }
       this.startHealthCheck();
       console.log('Redis connected and monitoring started');
     });
@@ -199,7 +203,8 @@ export class RedisManager {
             
             // Use binary serialization for better performance
             const binaryData = BinaryMessageCodec.encode(message);
-            pipeline.setex(key, ttlSeconds, binaryData);
+            // Store as base64 string to be Lua/EVAL-safe and avoid UTF-8 corruption
+            pipeline.setex(key, ttlSeconds, binaryData.toString('base64'));
           }
 
           await pipeline.exec();
@@ -506,12 +511,18 @@ export class RedisManager {
 
   async getFromHotQueue(queueName: string, count: number = 1): Promise<string[]> {
     const key = this.getHotQueueKey(queueName);
-    return await this.executeWithFallback(
+    // zpopmin returns [member1, score1, member2, score2, ...]; extract only members
+    const raw = await this.executeWithFallback(
       () => this.redis.zpopmin(key, count),
       [],
       'getFromHotQueue',
       false
     );
+    const ids: string[] = [];
+    for (let i = 0; i < raw.length; i += 2) {
+      ids.push(raw[i]);
+    }
+    return ids;
   }
 
   async removeFromHotQueue(queueName: string, messageId: string): Promise<void> {
@@ -520,6 +531,31 @@ export class RedisManager {
       () => this.redis.zrem(key, messageId),
       undefined,
       'removeFromHotQueue',
+      false
+    );
+  }
+
+  async removeCachedMessageBatch(queueName: string, messageIds: string[]): Promise<void> {
+    if (messageIds.length === 0) return;
+    await this.executeWithFallback(
+      () => {
+        const pipeline = this.redis.pipeline();
+        messageIds.forEach(id => pipeline.del(this.getMessageKey(queueName, id)));
+        return pipeline.exec();
+      },
+      undefined,
+      'removeCachedMessageBatch',
+      false
+    );
+  }
+
+  async removeFromHotQueueBatch(queueName: string, messageIds: string[]): Promise<void> {
+    if (messageIds.length === 0) return;
+    const key = this.getHotQueueKey(queueName);
+    await this.executeWithFallback(
+      () => this.redis.zrem(key, ...messageIds),
+      undefined,
+      'removeFromHotQueueBatch',
       false
     );
   }
@@ -543,5 +579,78 @@ export class RedisManager {
 
   private getHotQueueKey(queueName: string): string {
     return `${this.keyPrefix}hot:${queueName}`;
+  }
+
+  private getPendingDeleteKey(queueName: string, tempId: string): string {
+    return `${this.keyPrefix}penddel:${queueName}:${tempId}`;
+  }
+
+  private getIdMapKey(queueName: string, tempId: string): string {
+    return `${this.keyPrefix}idmap:${queueName}:${tempId}`;
+  }
+
+  async setPendingDelete(queueName: string, tempId: string, ttlSeconds: number): Promise<void> {
+    const key = this.getPendingDeleteKey(queueName, tempId);
+    await this.executeWithFallback(
+      () => this.redis.setex(key, ttlSeconds, '1'),
+      undefined,
+      'setPendingDelete',
+      false
+    );
+  }
+
+  async consumePendingDelete(queueName: string, tempId: string): Promise<boolean> {
+    const key = this.getPendingDeleteKey(queueName, tempId);
+    return await this.executeWithFallback(
+      async () => {
+        // Emulate GETDEL for older Redis by GET then DEL
+        const val = await this.redis.get(key);
+        if (val) {
+          await this.redis.del(key);
+          return true;
+        }
+        return false;
+      },
+      false,
+      'consumePendingDelete',
+      false
+    );
+  }
+
+  async setIdMapping(queueName: string, tempId: string, azureId: string, popReceipt?: string, ttlSeconds: number = 3600): Promise<void> {
+    const key = this.getIdMapKey(queueName, tempId);
+    const value = JSON.stringify({ azureId, popReceipt });
+    await this.executeWithFallback(
+      () => this.redis.setex(key, ttlSeconds, value),
+      undefined,
+      'setIdMapping',
+      false
+    );
+  }
+
+  async getIdMapping(queueName: string, tempId: string): Promise<{ azureId: string; popReceipt?: string } | null> {
+    const key = this.getIdMapKey(queueName, tempId);
+    const val = await this.executeWithFallback(
+      () => this.redis.get(key),
+      null,
+      'getIdMapping',
+      false
+    );
+    if (!val) return null;
+    try {
+      return JSON.parse(val);
+    } catch {
+      return null;
+    }
+  }
+
+  async removeIdMapping(queueName: string, tempId: string): Promise<void> {
+    const key = this.getIdMapKey(queueName, tempId);
+    await this.executeWithFallback(
+      () => this.redis.del(key),
+      undefined,
+      'removeIdMapping',
+      false
+    );
   }
 }

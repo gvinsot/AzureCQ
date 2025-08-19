@@ -110,7 +110,7 @@ class PerformanceTester {
 
     for (let i = 0; i < messageCount; i += batchSize) {
       const currentBatchSize = Math.min(batchSize, messageCount - i);
-      const batch = [];
+      const batch: Array<{content: string; options?: any}> = [];
 
       for (let j = 0; j < currentBatchSize; j++) {
         batch.push({

@@ -259,30 +259,26 @@ export class AzureManager {
     }>
   ): Promise<QueueMessage[]> {
     const results: QueueMessage[] = [];
-    const blobsToCleanup: string[] = [];
+    const concurrency = Math.min(64, messages.length);
 
     try {
-      for (const msg of messages) {
-        const result = await this.enqueueMessage(
-          msg.content,
-          msg.metadata,
-          msg.visibilityTimeoutSeconds,
-          msg.timeToLiveSeconds
+      for (let i = 0; i < messages.length; i += concurrency) {
+        const slice = messages.slice(i, i + concurrency);
+        const batchResults = await Promise.all(
+          slice.map(msg =>
+            this.enqueueMessage(
+              msg.content,
+              msg.metadata,
+              msg.visibilityTimeoutSeconds,
+              msg.timeToLiveSeconds
+            )
+          )
         );
-        results.push(result);
+        results.push(...batchResults);
       }
-      
+
       return results;
     } catch (error) {
-      // Clean up any blobs that were created before the failure
-      for (const blobName of blobsToCleanup) {
-        try {
-          await this.deleteLargeMessageFromBlob(blobName);
-        } catch (cleanupError) {
-          console.warn('Failed to cleanup blob after batch enqueue failure:', cleanupError);
-        }
-      }
-      
       throw new AzureCQError(
         'Failed to enqueue message batch',
         ErrorCodes.BATCH_OPERATION_FAILED,
@@ -368,21 +364,27 @@ export class AzureManager {
   async acknowledgeMessageBatch(
     messages: Array<{ messageId: string; popReceipt: string }>
   ): Promise<Array<{ messageId: string; success: boolean; error?: string }>> {
-    const results = [];
-    
-    for (const msg of messages) {
-      try {
-        await this.acknowledgeMessage(msg.messageId, msg.popReceipt);
-        results.push({ messageId: msg.messageId, success: true });
-      } catch (error) {
-        results.push({
-          messageId: msg.messageId,
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error'
-        });
-      }
+    const results: Array<{ messageId: string; success: boolean; error?: string }> = [];
+    const concurrency = Math.min(64, messages.length);
+
+    for (let i = 0; i < messages.length; i += concurrency) {
+      const slice = messages.slice(i, i + concurrency);
+      const batch = await Promise.all(
+        slice.map(async (msg) => {
+          try {
+            await this.acknowledgeMessage(msg.messageId, msg.popReceipt);
+            return { messageId: msg.messageId, success: true };
+          } catch (error) {
+            return {
+              messageId: msg.messageId,
+              success: false,
+              error: error instanceof Error ? error.message : 'Unknown error'
+            };
+          }
+        })
+      );
+      results.push(...batch);
     }
-    
     return results;
   }
 

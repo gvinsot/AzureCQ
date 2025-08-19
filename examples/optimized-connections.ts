@@ -11,8 +11,9 @@ async function optimizedConnectionExample(): Promise<void> {
   const config: QueueConfiguration = {
     name: 'optimized-queue',
     redis: {
-      host: 'localhost',
-      port: 6379,
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      password: process.env.REDIS_PASSWORD,
       keyPrefix: 'optimized:'
     },
     azure: {
@@ -211,7 +212,7 @@ async function connectionLifecycleExample(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'lifecycle-test',
-    redis: { host: 'localhost', port: 6379, keyPrefix: 'lifecycle:' },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD, keyPrefix: 'lifecycle:' },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'lifecycle-test',
@@ -280,7 +281,7 @@ async function performanceComparisonExample(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'perf-test',
-    redis: { host: 'localhost', port: 6379, keyPrefix: 'perf:' },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD, keyPrefix: 'perf:' },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'perf-test',

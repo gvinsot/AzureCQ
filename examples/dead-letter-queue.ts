@@ -10,8 +10,9 @@ async function deadLetterQueueExample(): Promise<void> {
   const config: QueueConfiguration = {
     name: 'order-processing',
     redis: {
-      host: 'localhost',
-      port: 6379,
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      password: process.env.REDIS_PASSWORD,
       keyPrefix: 'dlq-example:'
     },
     azure: {
@@ -238,7 +239,7 @@ async function productionDlqPatterns(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'production-orders',
-    redis: { host: 'localhost', port: 6379 },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'production-orders',

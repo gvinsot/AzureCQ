@@ -87,25 +87,60 @@ export class AzureCQ {
     this.ensureInitialized();
 
     try {
-      // Enqueue to Azure Storage (permanent storage)
-      const queueMessage = await this.azure.enqueueMessage(
-        message,
-        options.metadata,
-        options.visibilityTimeout,
-        options.timeToLive
-      );
+        // Generate ID locally, write to Redis first, then Azure in background
+        const tempId = uuidv4();
+        const now = new Date();
+        const queueMessage: QueueMessage = {
+          id: tempId,
+          content: Buffer.isBuffer(message) ? message : Buffer.from(message),
+          metadata: options.metadata || {},
+          dequeueCount: 0,
+          insertedOn: now,
+          nextVisibleOn: now
+        };
 
-      // Cache in Redis for fast access
-      await Promise.all([
-        this.redis.cacheMessage(
-          this.config.name,
-          queueMessage,
-          this.config.settings.redisCacheTtl
-        ),
-        this.redis.addToHotQueue(this.config.name, queueMessage.id)
-      ]);
+        await Promise.all([
+          this.redis.cacheMessage(this.config.name, queueMessage, this.config.settings.redisCacheTtl),
+          this.redis.addToHotQueue(this.config.name, queueMessage.id, Date.now())
+        ]);
 
-      return queueMessage;
+        // Kick off Azure write asynchronously; reconcile ID/popReceipt when done
+        void (async () => {
+          try {
+            // If consumer acknowledged before Azure write, skip Azure enqueue
+            const pendingDel = await this.redis.consumePendingDelete(this.config.name, tempId);
+            if (pendingDel) {
+              await this.redis.removeCachedMessage(this.config.name, tempId);
+              await this.redis.removeFromHotQueue(this.config.name, tempId);
+              return;
+            }
+            const azureMsg = await this.azure.enqueueMessage(
+              message,
+              options.metadata,
+              options.visibilityTimeout,
+              options.timeToLive
+            );
+            // Update cached message with Azure popReceipt and official ID
+            const updated: QueueMessage = {
+              ...queueMessage,
+              id: azureMsg.id,
+              popReceipt: azureMsg.popReceipt,
+              insertedOn: azureMsg.insertedOn,
+              nextVisibleOn: azureMsg.nextVisibleOn
+            };
+            await this.redis.cacheMessage(this.config.name, updated, this.config.settings.redisCacheTtl);
+            // Also update hot queue ID mapping by adding the new ID and removing the old
+            await this.redis.addToHotQueue(this.config.name, updated.id, Date.now());
+            await this.redis.removeFromHotQueue(this.config.name, tempId);
+            await this.redis.removeCachedMessage(this.config.name, tempId);
+            await this.redis.setIdMapping(this.config.name, tempId, azureMsg.id, azureMsg.popReceipt, this.config.settings.redisCacheTtl);
+          } catch (e) {
+            // Optionally: mark message as pending Azure failure in metadata
+          }
+        })();
+
+        return queueMessage;
+      
     } catch (error) {
       if (error instanceof AzureCQError) {
         throw error;
@@ -138,42 +173,76 @@ export class AzureCQ {
     }
 
     try {
-      // Prepare messages for Azure Storage
-      const azureMessages = messages.map(msg => ({
-        content: msg.content,
-        metadata: msg.options?.metadata,
-        visibilityTimeoutSeconds: msg.options?.visibilityTimeout,
-        timeToLiveSeconds: msg.options?.timeToLive
+      const now = new Date();
+      const tempMessages: QueueMessage[] = messages.map(() => ({
+        id: uuidv4(),
+        content: Buffer.alloc(0),
+        metadata: {},
+        dequeueCount: 0,
+        insertedOn: now,
+        nextVisibleOn: now
       }));
 
-      // Enqueue to Azure Storage
-      const queueMessages = await this.azure.enqueueMessageBatch(azureMessages);
+      // Fill content/metadata
+      tempMessages.forEach((m, i) => {
+        const src = messages[i];
+        m.content = Buffer.isBuffer(src.content) ? src.content : Buffer.from(src.content);
+        m.metadata = src.options?.metadata || {};
+      });
 
-              // Cache in Redis for fast access (using enhanced batch operations)
-        await Promise.all([
-          this.redis.cacheMessageBatch(
-            this.config.name,
-            queueMessages,
-            this.config.settings.redisCacheTtl
-          ),
-          this.redis.addToHotQueueBatch(
-            this.config.name,
-            queueMessages.map(msg => msg.id)
-          )
-        ]);
+      await Promise.all([
+        this.redis.cacheMessageBatch(this.config.name, tempMessages, this.config.settings.redisCacheTtl),
+        this.redis.addToHotQueueBatch(this.config.name, tempMessages.map(m => m.id))
+      ]);
+
+      // Fire-and-forget Azure writes in parallel with reasonable concurrency
+      void (async () => {
+        try {
+          // Filter out any temp IDs already acknowledged before Azure write
+          const remaining = [] as typeof messages;
+          const remainingTempIds: string[] = [];
+          for (let i = 0; i < tempMessages.length; i++) {
+            const tempId = tempMessages[i].id;
+            const wasAcked = await this.redis.consumePendingDelete(this.config.name, tempId);
+            if (!wasAcked) {
+              remaining.push(messages[i]);
+              remainingTempIds.push(tempId);
+            } else {
+              await this.redis.removeCachedMessage(this.config.name, tempId);
+              await this.redis.removeFromHotQueue(this.config.name, tempId);
+            }
+          }
+          if (remaining.length === 0) return;
+          const azureMessages = await this.azure.enqueueMessageBatch(
+            remaining.map(msg => ({
+              content: msg.content,
+              metadata: msg.options?.metadata,
+              visibilityTimeoutSeconds: msg.options?.visibilityTimeout,
+              timeToLiveSeconds: msg.options?.timeToLive
+            }))
+          );
+
+          // Re-cache with Azure IDs by simple add; old temp IDs will age out
+          await Promise.all([
+            this.redis.cacheMessageBatch(this.config.name, azureMessages, this.config.settings.redisCacheTtl),
+            this.redis.addToHotQueueBatch(this.config.name, azureMessages.map(m => m.id))
+          ]);
+          // Record ID mappings
+          await Promise.all(
+            azureMessages.map((m, idx) => this.redis.setIdMapping(this.config.name, remainingTempIds[idx], m.id, m.popReceipt, this.config.settings.redisCacheTtl))
+          );
+        } catch {}
+      })();
 
       return {
-        messages: queueMessages,
+        messages: tempMessages,
         batchId: uuidv4(),
-        count: queueMessages.length
+        count: tempMessages.length
       };
     } catch (error) {
-      if (error instanceof AzureCQError) {
-        throw error;
-      }
       throw new AzureCQError(
-        'Failed to enqueue message batch',
-        ErrorCodes.BATCH_OPERATION_FAILED,
+        'Failed to enqueue batch',
+        ErrorCodes.AZURE_STORAGE_ERROR,
         error as Error
       );
     }
@@ -197,16 +266,8 @@ export class AzureCQ {
     const batchId = uuidv4();
 
     try {
-      // First, try to get messages from Redis hot queue
-      const hotMessageIds = await this.redis.getFromHotQueue(this.config.name, maxMessages);
-      const cachedMessages: QueueMessage[] = [];
-
-      for (const messageId of hotMessageIds) {
-        const cached = await this.redis.getCachedMessage(this.config.name, messageId);
-        if (cached && cached.nextVisibleOn <= new Date()) {
-          cachedMessages.push(cached);
-        }
-      }
+      // First, try to get messages from Redis hot queue (atomic pop + fetch)
+      const cachedMessages: QueueMessage[] = await this.redis.atomicBatchDequeue(this.config.name, maxMessages);
 
       // If we need more messages, get them from Azure Storage
       let azureMessages: QueueMessage[] = [];
@@ -253,28 +314,31 @@ export class AzureCQ {
   async acknowledge(message: QueueMessage): Promise<AcknowledgmentResult> {
     this.ensureInitialized();
 
-    if (!message.popReceipt) {
-      return {
-        success: false,
-        error: 'Message pop receipt is required for acknowledgment',
-        messageId: message.id
-      };
-    }
-
     try {
-      // Delete from Azure Storage
-      await this.azure.acknowledgeMessage(message.id, message.popReceipt);
-
-      // Remove from Redis cache
+      // Fast-ack in Redis; schedule Azure delete if we have mapping
       await Promise.all([
         this.redis.removeCachedMessage(this.config.name, message.id),
-        this.redis.removeFromHotQueue(this.config.name, message.id)
+        this.redis.removeFromHotQueue(this.config.name, message.id),
+        this.redis.setPendingDelete(this.config.name, message.id, this.config.settings.redisCacheTtl)
       ]);
 
-      return {
-        success: true,
-        messageId: message.id
-      };
+      // Attempt immediate Azure delete if popReceipt present or mapping exists
+      void (async () => {
+        try {
+          if (message.popReceipt) {
+            await this.azure.acknowledgeMessage(message.id, message.popReceipt);
+            await this.redis.removeIdMapping(this.config.name, message.id);
+          } else {
+            const mapping = await this.redis.getIdMapping(this.config.name, message.id);
+            if (mapping?.popReceipt) {
+              await this.azure.acknowledgeMessage(mapping.azureId, mapping.popReceipt);
+              await this.redis.removeIdMapping(this.config.name, message.id);
+            }
+          }
+        } catch {}
+      })();
+
+      return { success: true, messageId: message.id };
     } catch (error) {
       return {
         success: false,
@@ -303,48 +367,35 @@ export class AzureCQ {
     const batchId = uuidv4();
     const results: AcknowledgmentResult[] = [];
 
-    // Prepare Azure Storage acknowledgments
-    const azureAcks = messages
-      .filter(msg => msg.popReceipt)
-      .map(msg => ({ messageId: msg.id, popReceipt: msg.popReceipt! }));
+    // Fast-ack in Redis for all
+    const ids = messages.map(m => m.id);
+    await Promise.all([
+      this.redis.removeCachedMessageBatch(this.config.name, ids),
+      this.redis.removeFromHotQueueBatch(this.config.name, ids),
+      ...ids.map(id => this.redis.setPendingDelete(this.config.name, id, this.config.settings.redisCacheTtl))
+    ]);
 
-    // Acknowledge in Azure Storage
-    const azureResults = await this.azure.acknowledgeMessageBatch(azureAcks);
+    // Best-effort Azure deletes where we have popReceipt or mapping
+    void (async () => {
+      try {
+        const directAcks = messages.filter(m => m.popReceipt).map(m => ({ messageId: m.id, popReceipt: m.popReceipt! }));
+        if (directAcks.length > 0) {
+          await this.azure.acknowledgeMessageBatch(directAcks);
+          await this.redis.removeCachedMessageBatch(this.config.name, directAcks.map(a => a.messageId));
+        }
+        const noReceipt = messages.filter(m => !m.popReceipt);
+        for (const m of noReceipt) {
+          const mapping = await this.redis.getIdMapping(this.config.name, m.id);
+          if (mapping?.popReceipt) {
+            await this.azure.acknowledgeMessage(mapping.azureId, mapping.popReceipt);
+            await this.redis.removeIdMapping(this.config.name, m.id);
+          }
+        }
+      } catch {}
+    })();
 
-    // Remove successful acknowledgments from Redis
-    const successfulIds: string[] = [];
-    for (const result of azureResults) {
-      const ackResult: AcknowledgmentResult = {
-        success: result.success,
-        messageId: result.messageId,
-        error: result.error
-      };
-      results.push(ackResult);
-
-      if (result.success) {
-        successfulIds.push(result.messageId);
-      }
-    }
-
-    // Handle messages without pop receipts
-    for (const msg of messages.filter(m => !m.popReceipt)) {
-      results.push({
-        success: false,
-        error: 'Message pop receipt is required for acknowledgment',
-        messageId: msg.id
-      });
-    }
-
-    // Clean up Redis cache for successful acknowledgments
-    if (successfulIds.length > 0) {
-      await Promise.all([
-        ...successfulIds.map(id => 
-          this.redis.removeCachedMessage(this.config.name, id)
-        ),
-        ...successfulIds.map(id => 
-          this.redis.removeFromHotQueue(this.config.name, id)
-        )
-      ]);
+    for (const id of ids) {
+      results.push({ success: true, messageId: id });
     }
 
     const successCount = results.filter(r => r.success).length;

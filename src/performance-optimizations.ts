@@ -156,7 +156,8 @@ export class AdvancedRedisOperations {
     return results?.map((result, index) => {
       if (result && result[0] === null && result[1]) {
         try {
-          return BinaryMessageCodec.decode(result[1] as Buffer);
+          const b64 = result[1] as string;
+          return BinaryMessageCodec.decode(Buffer.from(b64, 'base64'));
         } catch (error) {
           // Fallback to JSON parsing for backward compatibility
           try {
@@ -229,7 +230,7 @@ export class AdvancedRedisOperations {
       const dataStr = results[i + 1];
       
       try {
-        const data = BinaryMessageCodec.decode(Buffer.from(dataStr, 'binary'));
+        const data = BinaryMessageCodec.decode(Buffer.from(dataStr, 'base64'));
         messages.push({ id, data });
       } catch (error) {
         console.warn('Failed to decode cached message:', error);

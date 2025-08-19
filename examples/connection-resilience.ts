@@ -12,8 +12,9 @@ async function connectionResilienceExample(): Promise<void> {
   const config: QueueConfiguration = {
     name: 'resilience-test',
     redis: {
-      host: 'localhost',
-      port: 6379,
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      password: process.env.REDIS_PASSWORD,
       keyPrefix: 'resilience:'
     },
     azure: {
@@ -178,7 +179,7 @@ async function connectionStressTest(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'stress-test',
-    redis: { host: 'localhost', port: 6379, keyPrefix: 'stress:' },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD, keyPrefix: 'stress:' },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'stress-test',
@@ -264,7 +265,7 @@ async function productionMonitoringExample(): Promise<void> {
 
   const config: QueueConfiguration = {
     name: 'production-monitor',
-    redis: { host: 'localhost', port: 6379, keyPrefix: 'prod:' },
+    redis: { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), password: process.env.REDIS_PASSWORD, keyPrefix: 'prod:' },
     azure: {
       connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
       queueName: 'production-monitor',
