@@ -17,7 +17,7 @@
     "clean": "rimraf dist",
     "example:basic": "npx ts-node examples/basic-usage.ts",
     "example:dlq": "npx ts-node examples/dead-letter-queue.ts",
-    "example:azure-comparison": "npx ts-node examples/azure-storage-comparison.ts",
+    "example:azure-comparison": "npx ts-node examples/azure-storage-comparison.ts"
   },
   "keywords": [
     "queue",
