@@ -13,6 +13,7 @@
     "optimized": "npx ts-node optimized-connections.ts",
     "timeout": "npx ts-node acknowledgment-timeout.ts",
     "azure-comparison": "npx ts-node azure-storage-comparison.ts",
+    "hot-path": "npx ts-node hot-path-optimization.ts",
     "build": "tsc",
     "clean": "rimraf dist"
   },

@@ -121,17 +121,25 @@ export class AzureCQ {
         this.redis.addToHotQueue(this.config.name, queueMessage.id, Date.now())
       ]);
 
-      // Kick off Azure write asynchronously; reconcile ID/popReceipt when done
+      // Kick off Azure write asynchronously with hot path optimization
       void (async () => {
         try {
-          // If consumer acknowledged before Azure write, skip Azure enqueue
+          // Hot path optimization: delay before Azure write to see if message gets consumed immediately
+          const hotPathDelay = this.config.settings.hotPathDelayMs || 100; // Default 100ms
+          if (hotPathDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, hotPathDelay));
+          }
+
+          // If consumer acknowledged during hot path delay, skip Azure enqueue entirely
           const pendingDel = await this.redis.consumePendingDelete(this.config.name, tempId);
           if (pendingDel) {
             await this.redis.removeCachedMessage(this.config.name, tempId);
             await this.redis.removeFromHotQueue(this.config.name, tempId);
+            //console.log(`🔥 Hot path: Message ${tempId} consumed before Azure write - skipping Azure`);
             return;
           }
-          const minShadowVisibility = 30; // seconds
+
+          const minShadowVisibility = 300; // 5 minutes - effectively disable Azure consumption
           const azureMsg = await this.azure.enqueueMessage(
             message,
             options.metadata,
@@ -146,9 +154,18 @@ export class AzureCQ {
             insertedOn: azureMsg.insertedOn,
             nextVisibleOn: azureMsg.nextVisibleOn
           };
-          await this.redis.cacheMessage(this.config.name, updated, this.config.settings.redisCacheTtl);
-          // Keep temp entry in hot queue/cache until consumer acknowledges to avoid gaps
-          await this.redis.setIdMapping(this.config.name, tempId, azureMsg.id, azureMsg.popReceipt, this.config.settings.redisCacheTtl);
+          
+          // Atomically replace temp message with Azure message to prevent duplicates
+          const replaced = await this.redis.atomicReplaceWithAzureMessage(
+            this.config.name,
+            tempId, 
+            updated, 
+            this.config.settings.redisCacheTtl
+          );
+          
+          if (!replaced) {
+            // Temp message was already consumed during hot path - this is expected
+          }
         } catch (e) {
           // Optionally: mark message as pending Azure failure in metadata
         }
@@ -227,12 +244,20 @@ export class AzureCQ {
         this.redis.addToHotQueueBatch(this.config.name, tempMessages.map(m => m.id))
       ]);
 
-      // Fire-and-forget Azure writes in parallel with reasonable concurrency
+      // Fire-and-forget Azure writes with hot path optimization
       void (async () => {
         try {
-          // Filter out any temp IDs already acknowledged before Azure write
+          // Hot path optimization: delay before Azure write
+          const hotPathDelay = this.config.settings.hotPathDelayMs || 100; // Default 100ms
+          if (hotPathDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, hotPathDelay));
+          }
+
+          // Filter out any temp IDs already acknowledged during hot path delay
           const remaining = [] as typeof messages;
           const remainingTempIds: string[] = [];
+          let hotPathSkipped = 0;
+          
           for (let i = 0; i < tempMessages.length; i++) {
             const tempId = tempMessages[i].id;
             const wasAcked = await this.redis.consumePendingDelete(this.config.name, tempId);
@@ -242,10 +267,16 @@ export class AzureCQ {
             } else {
               await this.redis.removeCachedMessage(this.config.name, tempId);
               await this.redis.removeFromHotQueue(this.config.name, tempId);
+              hotPathSkipped++;
             }
           }
+          
+          // if (hotPathSkipped > 0) {
+          //   console.log(`🔥 Hot path: ${hotPathSkipped}/${tempMessages.length} messages consumed before Azure write - skipping Azure`);
+          // }
+          
           if (remaining.length === 0) return;
-          const minShadowVisibility = 30; // seconds
+          const minShadowVisibility = 300; // 5 minutes - effectively disable Azure consumption
           const azureMessages = await this.azure.enqueueMessageBatch(
             remaining.map(msg => ({
               content: msg.content,
@@ -255,16 +286,23 @@ export class AzureCQ {
             }))
           );
 
-          // Re-cache with Azure IDs by simple add; old temp IDs will age out
-          await Promise.all([
-            this.redis.cacheMessageBatch(this.config.name, azureMessages, this.config.settings.redisCacheTtl),
-            // do not add Azure IDs to hot queue to avoid duplicates with temp IDs
-            Promise.resolve()
-          ]);
-          // Record ID mappings
-          await Promise.all(
-            azureMessages.map((m, idx) => this.redis.setIdMapping(this.config.name, remainingTempIds[idx], m.id, m.popReceipt, this.config.settings.redisCacheTtl))
+          // Atomically replace temp messages with Azure messages to prevent duplicates
+          const replacements = azureMessages.map((azureMessage, idx) => ({
+            tempId: remainingTempIds[idx],
+            azureMessage
+          }));
+          
+          const replacedCount = await this.redis.atomicBatchReplaceWithAzureMessages(
+            this.config.name,
+            replacements,
+            this.config.settings.redisCacheTtl
           );
+          
+          // Log hot path efficiency for batch
+          // const hotPathCount = remainingTempIds.length - replacedCount;
+          // if (hotPathCount > 0) {
+          //   console.log(`🔥 Hot path: ${hotPathCount}/${remainingTempIds.length} messages consumed before Azure write - skipping Azure`);
+          // }
         } catch {}
       })();
 
@@ -717,6 +755,7 @@ export class QueueManager {
     return await this.azure.listQueues();
   }
 }
+
 
 
 

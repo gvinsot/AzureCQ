@@ -630,6 +630,107 @@ export class RedisManager {
     );
   }
 
+  /**
+   * Atomically replace temporary message with Azure message to prevent duplicates
+   */
+  static readonly ATOMIC_ID_REPLACE_SCRIPT = `
+    local queue_key = KEYS[1]
+    local temp_cache_key = KEYS[2]
+    local azure_cache_key = KEYS[3]
+    local id_map_key = KEYS[4]
+    local temp_id = ARGV[1]
+    local azure_message_data = ARGV[2]
+    local id_mapping_data = ARGV[3]
+    local ttl_seconds = tonumber(ARGV[4])
+    
+    -- Check if temp message still exists
+    local temp_exists = redis.call('EXISTS', temp_cache_key)
+    
+    if temp_exists == 1 then
+      -- Atomically: replace temp with azure message
+      redis.call('DEL', temp_cache_key)
+      redis.call('ZREM', queue_key, temp_id)
+      redis.call('SETEX', azure_cache_key, ttl_seconds, azure_message_data)
+      redis.call('SETEX', id_map_key, ttl_seconds, id_mapping_data)
+      return 1
+    else
+      -- Temp message was already consumed
+      return 0
+    end
+  `;
+
+  async atomicReplaceWithAzureMessage(
+    queueName: string, 
+    tempId: string, 
+    azureMessage: QueueMessage, 
+    ttlSeconds: number
+  ): Promise<boolean> {
+    const queueKey = this.getHotQueueKey(queueName);
+    const tempCacheKey = this.getMessageKey(queueName, tempId);
+    const azureCacheKey = this.getMessageKey(queueName, azureMessage.id);
+    const idMapKey = this.getIdMapKey(queueName, tempId);
+    
+    const azureMessageData = BinaryMessageCodec.encode(azureMessage).toString('base64');
+    const idMappingData = JSON.stringify({ 
+      azureId: azureMessage.id, 
+      popReceipt: azureMessage.popReceipt 
+    });
+
+    const result = await this.executeWithFallback(
+      async () => {
+        return await this.redis.eval(
+          RedisManager.ATOMIC_ID_REPLACE_SCRIPT,
+          4,
+          queueKey,
+          tempCacheKey,
+          azureCacheKey,
+          idMapKey,
+          tempId,
+          azureMessageData,
+          idMappingData,
+          ttlSeconds.toString()
+        ) as number;
+      },
+      0,
+      'atomicReplaceWithAzureMessage',
+      false
+    );
+
+    return result === 1;
+  }
+
+  /**
+   * Batch version of atomic ID replacement
+   */
+  async atomicBatchReplaceWithAzureMessages(
+    queueName: string, 
+    replacements: Array<{ tempId: string; azureMessage: QueueMessage }>, 
+    ttlSeconds: number
+  ): Promise<number> {
+    if (replacements.length === 0) return 0;
+
+    const queueKey = this.getHotQueueKey(queueName);
+    let successCount = 0;
+
+    // Process in smaller batches to avoid Redis script limits
+    const batchSize = 10;
+    for (let i = 0; i < replacements.length; i += batchSize) {
+      const batch = replacements.slice(i, i + batchSize);
+      
+      for (const { tempId, azureMessage } of batch) {
+        const replaced = await this.atomicReplaceWithAzureMessage(
+          queueName, 
+          tempId, 
+          azureMessage, 
+          ttlSeconds
+        );
+        if (replaced) successCount++;
+      }
+    }
+
+    return successCount;
+  }
+
   async getIdMapping(queueName: string, tempId: string): Promise<{ azureId: string; popReceipt?: string } | null> {
     const key = this.getIdMapKey(queueName, tempId);
     const val = await this.executeWithFallback(

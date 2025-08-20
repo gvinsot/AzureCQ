@@ -26,7 +26,7 @@ class AzureStorageComparison {
   private queueServiceClient: QueueServiceClient;
   private blobServiceClient: BlobServiceClient;
   private connectionString: string;
-  private readonly queueName = 'perf-comparison-queue';
+  private readonly queueName = 'perf-comparison-v2-queue';
   private readonly azureDirectQueueName = 'perf-direct-queue';
 
   constructor() {
@@ -66,12 +66,13 @@ class AzureStorageComparison {
       azure: {
         connectionString,
         queueName: this.queueName,
-        containerName: 'perf-comparison-container'
+        containerName: 'perf-comparison-v2-container'
       },
       settings: {
         maxInlineMessageSize: 64 * 1024, // 64KB
         redisCacheTtl: 3600, // 1 hour
         batchSize: 64,
+        hotPathDelayMs: 50, // 50ms hot path delay for immediate consumption detection
         retry: {
           maxAttempts: 3,
           backoffMs: 1000
@@ -680,7 +681,7 @@ async function runPerformanceComparison(): Promise<void> {
     console.log('🏁 Starting Azure Storage Performance Comparison');
     console.log('================================================');
 
-    const total = 20000;
+          const total = 10000;
     const producers = 8;
     const consumers = 8;
     const batchSize = 64;

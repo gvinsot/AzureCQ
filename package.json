@@ -18,7 +18,9 @@
     "example:basic": "npx ts-node examples/basic-usage.ts",
     "example:queue-mgmt": "npx ts-node examples/queue-management.ts",
     "example:dlq": "npx ts-node examples/dead-letter-queue.ts",
-    "example:azure-comparison": "npx ts-node examples/azure-storage-comparison.ts"
+    "example:azure-comparison": "npx ts-node examples/azure-storage-comparison.ts",
+    "example:hot-path": "npx ts-node examples/hot-path-optimization.ts",
+    "example:test-duplicate-fix": "npx ts-node examples/test-duplicate-fix.ts"
   },
   "keywords": [
     "queue",

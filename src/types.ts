@@ -78,6 +78,8 @@ export interface QueueConfiguration {
     redisCacheTtl: number;
     /** Batch size for Azure Storage operations */
     batchSize: number;
+    /** Hot path optimization - delay before Azure write (ms) */
+    hotPathDelayMs?: number;
     /** Retry configuration */
     retry: {
       maxAttempts: number;
