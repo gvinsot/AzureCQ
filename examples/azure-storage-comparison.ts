@@ -681,7 +681,7 @@ async function runPerformanceComparison(): Promise<void> {
     console.log('🏁 Starting Azure Storage Performance Comparison');
     console.log('================================================');
 
-          const total = 10000;
+    const total = 20000;
     const producers = 8;
     const consumers = 8;
     const batchSize = 64;

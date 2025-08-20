@@ -1,6 +1,6 @@
 {
   "name": "azurecq",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Azure Cheap Queues is a High-performance queue system based on Redis and Azure Storage with message durability guarantees",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -16,11 +16,8 @@
     "prepare": "npm run build",
     "clean": "rimraf dist",
     "example:basic": "npx ts-node examples/basic-usage.ts",
-    "example:queue-mgmt": "npx ts-node examples/queue-management.ts",
     "example:dlq": "npx ts-node examples/dead-letter-queue.ts",
     "example:azure-comparison": "npx ts-node examples/azure-storage-comparison.ts",
-    "example:hot-path": "npx ts-node examples/hot-path-optimization.ts",
-    "example:test-duplicate-fix": "npx ts-node examples/test-duplicate-fix.ts"
   },
   "keywords": [
     "queue",
