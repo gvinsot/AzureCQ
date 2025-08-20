@@ -5,10 +5,9 @@ A high-performance, cost-effective queue system that combines Redis for hot cach
 ## 🚀 Features
 
 - **Hybrid Architecture**: Redis for hot message cache + Azure Storage for persistence
-- **Zero Message Loss**: Guaranteed message durability through Azure Storage
-- **High Performance**: Redis caching and batch operations for optimal throughput
+- **High Performance**: Redis caching and batch operations for optimal throughput, gaining between x10 and x20 performance compared to Azure Storage Queue alone
 - **Large Message Support**: Automatic handling of messages >64KB via Azure Blob Storage
-- **Cost Effective**: Significantly cheaper than Azure Service Bus
+- **Cost Effective**: Around 80% cheaper than Azure Service Bus
 - **Batch Operations**: Efficient batch enqueue/dequeue with individual acknowledgments
 - **Dead Letter Queue**: Automatic retry logic with configurable DLQ for failed messages
 - **Message Recovery**: Manual and batch operations to move messages between queues

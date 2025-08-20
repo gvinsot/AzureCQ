@@ -92,7 +92,7 @@ async function basicExample(): Promise<void> {
     console.log(`✅ Dequeued batch: ${receivedBatch.count} messages`);
 
     // Process and acknowledge messages
-    const processedMessages = [];
+    const processedMessages: import('../src').QueueMessage[] = [];
     for (const msg of receivedBatch.messages) {
       console.log(`📄 Processing message ${msg.id}: ${msg.content.toString().substring(0, 50)}...`);
       
@@ -120,7 +120,9 @@ async function basicExample(): Promise<void> {
       console.log(`✅ Dequeued large message: ${receivedLarge.id} (${receivedLarge.content.length} bytes)`);
       
       // Verify content integrity
-      const isContentValid = receivedLarge.content.equals(largeMessage);
+      const isContentValid = Buffer.isBuffer(receivedLarge.content)
+        ? receivedLarge.content.equals(largeMessage)
+        : Buffer.from(receivedLarge.content).equals(largeMessage);
       console.log(`✅ Content integrity: ${isContentValid ? 'VALID' : 'INVALID'}`);
 
       await queue.acknowledge(receivedLarge);

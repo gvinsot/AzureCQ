@@ -5,6 +5,7 @@
 
 import { AzureCQ, QueueConfiguration } from '../src';
 import { QueueServiceClient, QueueClient, StorageSharedKeyCredential } from '@azure/storage-queue';
+import { BlobServiceClient } from '@azure/storage-blob';
 
 interface PerformanceResult {
   operation: string;
@@ -23,11 +24,14 @@ class AzureStorageComparison {
   private azureCQ: AzureCQ;
   private azureQueue: QueueClient;
   private queueServiceClient: QueueServiceClient;
+  private blobServiceClient: BlobServiceClient;
+  private connectionString: string;
   private readonly queueName = 'perf-comparison-queue';
   private readonly azureDirectQueueName = 'perf-direct-queue';
 
   constructor() {
     const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING || '';
+    this.connectionString = connectionString;
     
     // Validate connection string
     if (!connectionString) {
@@ -107,6 +111,7 @@ class AzureStorageComparison {
         this.queueServiceClient = new QueueServiceClient(connectionString);
       }
       this.azureQueue = this.queueServiceClient.getQueueClient(this.azureDirectQueueName);
+      this.blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
       console.log('✅ Azure Storage Queue client initialized');
     } catch (error) {
       console.error('❌ Failed to initialize Azure Storage Queue client:', error);
@@ -119,6 +124,51 @@ class AzureStorageComparison {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  private buildDirectMessageText(idx: number): string {
+    const raw = `e2e message ${idx}`;
+    const contentB64 = Buffer.from(raw).toString('base64');
+    return JSON.stringify({ type: 'inline', content: contentB64, metadata: { idx } });
+  }
+
+  private buildCqBatch(start: number, count: number): Array<{ content: string; options?: any }> {
+    const batch: Array<{ content: string; options?: any }> = [];
+    for (let i = 0; i < count; i++) {
+      const idx = start + i;
+      batch.push({ content: `e2e message ${idx}`, options: { metadata: { idx } } });
+    }
+    return batch;
+  }
+
+  private extractIndexFromText(text: string): number | null {
+    try {
+      const parsed = JSON.parse(text);
+      // For Azure Direct messages with new format
+      if (parsed && parsed.metadata && typeof parsed.metadata.idx === 'number') {
+        return parsed.metadata.idx;
+      }
+      // For Azure Direct messages with base64 content
+      if (parsed && typeof parsed.content === 'string') {
+        try {
+          const decoded = Buffer.from(parsed.content, 'base64').toString('utf8');
+          const m = decoded.match(/e2e message (\d+)/);
+          if (m) return parseInt(m[1], 10);
+        } catch {}
+        // Also try direct pattern match on content
+        const m = parsed.content.match(/e2e message (\d+)/);
+        if (m) return parseInt(m[1], 10);
+      }
+    } catch {
+      try {
+        const decoded = Buffer.from(text, 'base64').toString('utf8');
+        const m = decoded.match(/e2e message (\d+)/);
+        if (m) return parseInt(m[1], 10);
+      } catch {}
+      const m = text.match(/e2e message (\d+)/);
+      if (m) return parseInt(m[1], 10);
+    }
+    return null;
+  }
+
   async testEndToEnd(
     approach: 'AzureCQ' | 'Azure Direct',
     totalMessages: number,
@@ -129,38 +179,39 @@ class AzureStorageComparison {
     console.log(`\n🔄 Running end-to-end (${approach}) with ${producerConcurrency} producers + ${consumerConcurrency} consumers, total ${totalMessages} messages...`);
 
     let enqueued = 0;
+    let nextIndex = 0;
     let processed = 0;
     const startTime = Date.now();
 
-    const reserveEnqueueChunk = (max: number) => {
-      if (enqueued >= totalMessages) return 0;
-      const take = Math.min(max, totalMessages - enqueued);
-      enqueued += take;
-      return take;
+    const reserveEnqueueChunk = (max: number): { start: number; count: number } => {
+      if (nextIndex >= totalMessages) return { start: -1, count: 0 };
+      const start = nextIndex;
+      const count = Math.min(max, totalMessages - nextIndex);
+      nextIndex += count;
+      enqueued = nextIndex;
+      return { start, count };
     };
 
     const writeSamples: number[] = [];
     const readSamples: number[] = [];
+    const counts = new Map<number, number>();
 
     const producerWorkers: Promise<void>[] = [];
     for (let p = 0; p < producerConcurrency; p++) {
       producerWorkers.push((async () => {
         while (true) {
-          const take = reserveEnqueueChunk(batchSize);
+          const { start, count: take } = reserveEnqueueChunk(batchSize);
           if (take <= 0) break;
 
           const writeStart = Date.now();
           if (approach === 'AzureCQ') {
-            const batch: Array<{ content: string; options?: any }> = [];
-            for (let i = 0; i < take; i++) {
-              batch.push({ content: `e2e message ${i}` });
-            }
+            const batch = this.buildCqBatch(start, take);
             await this.azureCQ.enqueueBatch(batch);
           } else {
             const promises: Promise<any>[] = [];
             for (let i = 0; i < take; i++) {
-              const payload = Buffer.from(JSON.stringify({ content: `e2e message ${i}` })).toString('base64');
-              promises.push(this.azureQueue.sendMessage(payload));
+              const text = this.buildDirectMessageText(start + i);
+              promises.push(this.azureQueue.sendMessage(text));
             }
             await Promise.all(promises);
           }
@@ -186,10 +237,24 @@ class AzureStorageComparison {
             if (result.messages.length === 0) {
               if (enqueued >= totalMessages) {
                 // No more messages expected
+
                 break;
               }
               await this.sleep(60);
               continue;
+            }
+
+            
+            // Track indices for validation (prefer metadata when available)
+            for (const m of result.messages) {
+              const metaIdx = (m as any).metadata?.idx;
+              if (typeof metaIdx === 'number') {
+                counts.set(metaIdx, (counts.get(metaIdx) || 0) + 1);
+                continue;
+              }
+              const text = m.content.toString();
+              const idx = this.extractIndexFromText(text);
+              if (idx !== null) counts.set(idx, (counts.get(idx) || 0) + 1);
             }
             await this.azureCQ.acknowledgeBatch(result.messages);
             reserveProcessed(result.messages.length);
@@ -205,6 +270,11 @@ class AzureStorageComparison {
               await this.sleep(60);
               continue;
             }
+            // Track indices for validation
+            for (const item of items) {
+              const idx = this.extractIndexFromText(item.messageText || '');
+              if (idx !== null) counts.set(idx, (counts.get(idx) || 0) + 1);
+            }
             await Promise.all(items.map(m => this.azureQueue.deleteMessage(m.messageId, m.popReceipt)));
             reserveProcessed(items.length);
             const readEnd = Date.now();
@@ -218,14 +288,30 @@ class AzureStorageComparison {
 
     const duration = (Date.now() - startTime) / 1000;
 
+    // Validation: exactly-once processing check
+    let duplicates = 0;
+    let missing = 0;
+    let seen = 0;
+    for (let i = 0; i < totalMessages; i++) {
+      const c = counts.get(i) || 0;
+      if (c === 0) missing++;
+      if (c > 1) duplicates += (c - 1);
+      if (c > 0) seen++;
+    }
+    if (missing === 0 && duplicates === 0) {
+      console.log('✅ Exactly-once check passed: all messages processed once.');
+    } else {
+      console.warn(`⚠️ Exactly-once check failed: missing=${missing}, duplicates=${duplicates}`);
+    }
+
     const avg = (arr: number[]) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
     return {
       operation: 'End-to-End',
       approach,
-      totalMessages,
+      totalMessages: seen,
       duration,
-      messagesPerSecond: totalMessages / duration,
+      messagesPerSecond: seen / duration,
       avgLatency: duration * 1000,
       minLatency: duration * 1000,
       maxLatency: duration * 1000,
@@ -246,26 +332,70 @@ class AzureStorageComparison {
     console.log('✅ Azure Storage Queue initialized');
   }
 
+  async resetEnvironment(): Promise<void> {
+    console.log('🗑️ Resetting environment (deleting and recreating queues/containers)...');
+    
+    // Delete and recreate both queues and the blob container to start clean with proper waits
+    const directQueue = this.queueServiceClient.getQueueClient(this.azureDirectQueueName);
+    const mainQueue = this.queueServiceClient.getQueueClient(this.queueName);
+    const container = this.blobServiceClient.getContainerClient('perf-comparison-container');
+
+    try { await directQueue.delete(); } catch {}
+    try { await mainQueue.delete(); } catch {}
+    try { await container.delete(); } catch {}
+
+    // Wait until deletions are fully completed (increased wait time)
+    for (let i = 0; i < 200; i++) {
+      const [dExists, mExists, cExists] = await Promise.all([
+        directQueue.exists(),
+        mainQueue.exists(),
+        container.exists()
+      ]);
+      if (!dExists && !mExists && !cExists) break;
+      await this.sleep(500); // Increased from 200ms to 500ms
+    }
+
+    // Create fresh resources
+    await directQueue.create().catch(() => {});
+    await mainQueue.create().catch(() => {});
+    await container.create().catch(() => {});
+
+    // Refresh client reference
+    this.azureQueue = directQueue;
+
+    // Clear Redis data to avoid stale messages from previous runs
+    await this.clearRedisOnly();
+    
+    console.log('✅ Environment reset completed.');
+  }
+
+  async clearRedisOnly(): Promise<void> {
+    if (this.azureCQ) {
+      try {
+        console.log('🗑️ Clearing Redis data between tests...');
+        const redis = (this.azureCQ as any).redis;
+        if (redis && redis.redis) {
+          const keys = await redis.redis.keys('comparison:*');
+          if (keys.length > 0) {
+            // Delete keys in smaller batches to avoid stack overflow
+            const batchSize = 100;
+            for (let i = 0; i < keys.length; i += batchSize) {
+              const batch = keys.slice(i, i + batchSize);
+              await redis.redis.del(...batch);
+            }
+            console.log(`✅ Cleared ${keys.length} Redis keys`);
+          }
+        }
+      } catch (error) {
+        console.warn('⚠️ Failed to clear Redis data:', error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
   async cleanup(): Promise<void> {
     console.log('🧹 Cleaning up...');
     
-    // Clear AzureCQ queue
-    try {
-      let message = await this.azureCQ.dequeue();
-      while (message) {
-        await this.azureCQ.acknowledge(message);
-        message = await this.azureCQ.dequeue();
-      }
-    } catch (error) {
-      // Queue might be empty
-    }
-
-    // Clear Azure Storage Queue
-    try {
-      await this.azureQueue.clearMessages();
-    } catch (error) {
-      // Queue might be empty
-    }
+    await this.resetEnvironment();
 
     await this.azureCQ.shutdown();
     console.log('✅ Cleanup completed');
@@ -543,18 +673,24 @@ async function runPerformanceComparison(): Promise<void> {
   const comparison = new AzureStorageComparison();
 
   try {
+    // Clean up before starting tests for a consistent baseline
+    await comparison.resetEnvironment();
     await comparison.initialize();
 
     console.log('🏁 Starting Azure Storage Performance Comparison');
     console.log('================================================');
 
-    const total = 1000;
+    const total = 20000;
     const producers = 8;
     const consumers = 8;
     const batchSize = 64;
 
     // End-to-end test for AzureCQ and Azure Direct
     const azureCqE2E = await comparison.testEndToEnd('AzureCQ', total, producers, consumers, batchSize);
+    
+    // Clear Redis between tests to ensure clean state
+    await comparison.clearRedisOnly();
+    
     const azureDirectE2E = await comparison.testEndToEnd('Azure Direct', total, producers, consumers, Math.min(batchSize, 32));
 
     comparison.printResult(azureCqE2E);

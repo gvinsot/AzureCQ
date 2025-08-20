@@ -154,7 +154,7 @@ async function deadLetterQueueExample(): Promise<void> {
     console.log('\n📦 Example 5: Batch DLQ Operations');
     
     // Create multiple failing messages
-    const batchMessages = [];
+    const batchMessages: QueueMessage[] = [];
     for (let i = 1; i <= 3; i++) {
       const msg = await queue.enqueue(JSON.stringify({
         batchId: `batch-${i}`,
@@ -271,7 +271,7 @@ async function productionDlqPatterns(): Promise<void> {
     
     if (dequeued) {
       // Simulate different error types
-      const errorType = 'PAYMENT_GATEWAY_DOWN'; // Could be 'VALIDATION_ERROR', 'TIMEOUT', etc.
+      let errorType: 'PAYMENT_GATEWAY_DOWN' | 'VALIDATION_ERROR' | 'TIMEOUT' = 'PAYMENT_GATEWAY_DOWN';
       
       switch (errorType) {
         case 'PAYMENT_GATEWAY_DOWN':

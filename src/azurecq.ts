@@ -29,6 +29,11 @@ export class AzureCQ {
   private deadLetter: DeadLetterManager;
   private config: QueueConfiguration;
   private isInitialized = false;
+  // Cached Redis connection status to avoid frequent checks
+  private redisStatusCache?: {
+    status: { isConnected: boolean; isConnecting: boolean; shouldReconnect: boolean; isHealthCheckActive: boolean; hasCustomReconnectScheduled: boolean };
+    lastCheckedMs: number;
+  };
 
   constructor(config: QueueConfiguration) {
     this.config = config;
@@ -87,59 +92,69 @@ export class AzureCQ {
     this.ensureInitialized();
 
     try {
-        // Generate ID locally, write to Redis first, then Azure in background
-        const tempId = uuidv4();
-        const now = new Date();
-        const queueMessage: QueueMessage = {
-          id: tempId,
-          content: Buffer.isBuffer(message) ? message : Buffer.from(message),
-          metadata: options.metadata || {},
-          dequeueCount: 0,
-          insertedOn: now,
-          nextVisibleOn: now
-        };
-
-        await Promise.all([
-          this.redis.cacheMessage(this.config.name, queueMessage, this.config.settings.redisCacheTtl),
-          this.redis.addToHotQueue(this.config.name, queueMessage.id, Date.now())
-        ]);
-
-        // Kick off Azure write asynchronously; reconcile ID/popReceipt when done
-        void (async () => {
-          try {
-            // If consumer acknowledged before Azure write, skip Azure enqueue
-            const pendingDel = await this.redis.consumePendingDelete(this.config.name, tempId);
-            if (pendingDel) {
-              await this.redis.removeCachedMessage(this.config.name, tempId);
-              await this.redis.removeFromHotQueue(this.config.name, tempId);
-              return;
-            }
-            const azureMsg = await this.azure.enqueueMessage(
-              message,
-              options.metadata,
-              options.visibilityTimeout,
-              options.timeToLive
-            );
-            // Update cached message with Azure popReceipt and official ID
-            const updated: QueueMessage = {
-              ...queueMessage,
-              id: azureMsg.id,
-              popReceipt: azureMsg.popReceipt,
-              insertedOn: azureMsg.insertedOn,
-              nextVisibleOn: azureMsg.nextVisibleOn
-            };
-            await this.redis.cacheMessage(this.config.name, updated, this.config.settings.redisCacheTtl);
-            // Also update hot queue ID mapping by adding the new ID and removing the old
-            await this.redis.addToHotQueue(this.config.name, updated.id, Date.now());
-            await this.redis.removeFromHotQueue(this.config.name, tempId);
-            await this.redis.removeCachedMessage(this.config.name, tempId);
-            await this.redis.setIdMapping(this.config.name, tempId, azureMsg.id, azureMsg.popReceipt, this.config.settings.redisCacheTtl);
-          } catch (e) {
-            // Optionally: mark message as pending Azure failure in metadata
-          }
-        })();
-
+      // Redis fallback: if not connected, write directly to Azure
+      const redisStatus = this.getRedisStatusThrottled();
+      if (!redisStatus.isConnected) {
+        const queueMessage = await this.azure.enqueueMessage(
+          message,
+          options.metadata,
+          options.visibilityTimeout,
+          options.timeToLive
+        );
         return queueMessage;
+      }
+      
+      // Generate ID locally, write to Redis first, then Azure in background
+      const tempId = uuidv4();
+      const now = new Date();
+      const queueMessage: QueueMessage = {
+        id: tempId,
+        content: Buffer.isBuffer(message) ? message : Buffer.from(message),
+        metadata: options.metadata || {},
+        dequeueCount: 0,
+        insertedOn: now,
+        nextVisibleOn: now
+      };
+
+      await Promise.all([
+        this.redis.cacheMessage(this.config.name, queueMessage, this.config.settings.redisCacheTtl),
+        this.redis.addToHotQueue(this.config.name, queueMessage.id, Date.now())
+      ]);
+
+      // Kick off Azure write asynchronously; reconcile ID/popReceipt when done
+      void (async () => {
+        try {
+          // If consumer acknowledged before Azure write, skip Azure enqueue
+          const pendingDel = await this.redis.consumePendingDelete(this.config.name, tempId);
+          if (pendingDel) {
+            await this.redis.removeCachedMessage(this.config.name, tempId);
+            await this.redis.removeFromHotQueue(this.config.name, tempId);
+            return;
+          }
+          const minShadowVisibility = 30; // seconds
+          const azureMsg = await this.azure.enqueueMessage(
+            message,
+            options.metadata,
+            Math.max(options.visibilityTimeout || 0, minShadowVisibility),
+            options.timeToLive
+          );
+          // Update cached message with Azure popReceipt and official ID
+          const updated: QueueMessage = {
+            ...queueMessage,
+            id: azureMsg.id,
+            popReceipt: azureMsg.popReceipt,
+            insertedOn: azureMsg.insertedOn,
+            nextVisibleOn: azureMsg.nextVisibleOn
+          };
+          await this.redis.cacheMessage(this.config.name, updated, this.config.settings.redisCacheTtl);
+          // Keep temp entry in hot queue/cache until consumer acknowledges to avoid gaps
+          await this.redis.setIdMapping(this.config.name, tempId, azureMsg.id, azureMsg.popReceipt, this.config.settings.redisCacheTtl);
+        } catch (e) {
+          // Optionally: mark message as pending Azure failure in metadata
+        }
+      })();
+
+      return queueMessage;
       
     } catch (error) {
       if (error instanceof AzureCQError) {
@@ -173,6 +188,23 @@ export class AzureCQ {
     }
 
     try {
+      // Redis fallback: if not connected, write directly to Azure
+      const redisStatus = this.getRedisStatusThrottled();
+      if (!redisStatus.isConnected) {
+        const azureMessages = await this.azure.enqueueMessageBatch(
+          messages.map(msg => ({
+            content: msg.content,
+            metadata: msg.options?.metadata,
+            visibilityTimeoutSeconds: msg.options?.visibilityTimeout,
+            timeToLiveSeconds: msg.options?.timeToLive
+          }))
+        );
+        return {
+          messages: azureMessages,
+          batchId: uuidv4(),
+          count: azureMessages.length
+        };
+      }
       const now = new Date();
       const tempMessages: QueueMessage[] = messages.map(() => ({
         id: uuidv4(),
@@ -213,11 +245,12 @@ export class AzureCQ {
             }
           }
           if (remaining.length === 0) return;
+          const minShadowVisibility = 30; // seconds
           const azureMessages = await this.azure.enqueueMessageBatch(
             remaining.map(msg => ({
               content: msg.content,
               metadata: msg.options?.metadata,
-              visibilityTimeoutSeconds: msg.options?.visibilityTimeout,
+              visibilityTimeoutSeconds: Math.max(msg.options?.visibilityTimeout || 0, minShadowVisibility),
               timeToLiveSeconds: msg.options?.timeToLive
             }))
           );
@@ -225,7 +258,8 @@ export class AzureCQ {
           // Re-cache with Azure IDs by simple add; old temp IDs will age out
           await Promise.all([
             this.redis.cacheMessageBatch(this.config.name, azureMessages, this.config.settings.redisCacheTtl),
-            this.redis.addToHotQueueBatch(this.config.name, azureMessages.map(m => m.id))
+            // do not add Azure IDs to hot queue to avoid duplicates with temp IDs
+            Promise.resolve()
           ]);
           // Record ID mappings
           await Promise.all(
@@ -266,8 +300,12 @@ export class AzureCQ {
     const batchId = uuidv4();
 
     try {
-      // First, try to get messages from Redis hot queue (atomic pop + fetch)
-      const cachedMessages: QueueMessage[] = await this.redis.atomicBatchDequeue(this.config.name, maxMessages);
+      // If Redis connected, try hot queue first; else skip to Azure
+      let cachedMessages: QueueMessage[] = [];
+      const redisStatus = this.getRedisStatusThrottled();
+      if (redisStatus.isConnected) {
+        cachedMessages = await this.redis.atomicBatchDequeue(this.config.name, maxMessages);
+      }
 
       // If we need more messages, get them from Azure Storage
       let azureMessages: QueueMessage[] = [];
@@ -280,7 +318,7 @@ export class AzureCQ {
         );
 
         // Cache newly retrieved messages in Redis
-        if (azureMessages.length > 0) {
+        if (azureMessages.length > 0 && redisStatus.isConnected) {
           await this.redis.cacheMessageBatch(
             this.config.name,
             azureMessages,
@@ -630,6 +668,18 @@ export class AzureCQ {
         ErrorCodes.AZURE_STORAGE_ERROR
       );
     }
+  }
+
+  // Throttle Redis status checks to once every 15 seconds
+  private getRedisStatusThrottled(): { isConnected: boolean; isConnecting: boolean; shouldReconnect: boolean; isHealthCheckActive: boolean; hasCustomReconnectScheduled: boolean } {
+    const now = Date.now();
+    const throttleMs = 15000;
+    if (!this.redisStatusCache || now - this.redisStatusCache.lastCheckedMs > throttleMs) {
+      const status = this.redis.getConnectionStatus();
+      this.redisStatusCache = { status, lastCheckedMs: now };
+      return status;
+    }
+    return this.redisStatusCache.status;
   }
 }
 

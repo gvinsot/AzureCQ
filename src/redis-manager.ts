@@ -276,9 +276,11 @@ export class RedisManager {
         async () => {
           const key = this.getHotQueueKey(queueName);
           const pipeline = this.redis.pipeline();
+          const now = Date.now();
           
           messageIds.forEach((messageId, index) => {
-            const priority = priorities?.[index] || Date.now();
+            // add slight per-item jitter to preserve order and reduce contention
+            const priority = (priorities?.[index] ?? now) + index * 0.0001;
             pipeline.zadd(key, priority, messageId);
           });
           

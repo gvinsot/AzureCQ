@@ -211,7 +211,7 @@ async function acknowledgmentTimeoutExample(): Promise<void> {
     console.log('\n5️⃣  Monitoring Unacknowledged Messages');
     
     // Create some unacknowledged messages
-    const unackedMessages = [];
+    const unackedMessages: import('../src').QueueMessage[] = [];
     for (let i = 1; i <= 3; i++) {
       const msg = await queue.enqueue(`Unacknowledged message ${i}`, {
         metadata: { monitoring: true, number: i }
@@ -223,7 +223,7 @@ async function acknowledgmentTimeoutExample(): Promise<void> {
 
     // Dequeue them with short timeouts and don't acknowledge
     const shortTimeout = 3;
-    const dequeuedUnacked = [];
+    const dequeuedUnacked: import('../src').QueueMessage[] = [];
     
     for (let i = 0; i < unackedMessages.length; i++) {
       const msg = await queue.dequeue({ visibilityTimeout: shortTimeout });
