@@ -78,8 +78,13 @@ export interface QueueConfiguration {
     redisCacheTtl: number;
     /** Batch size for Azure Storage operations */
     batchSize: number;
-    /** Hot path optimization - delay before Azure write (ms) */
+    /** Hot path optimization - delay before Azure write (ms). Set to 0 for durability-critical scenarios */
     hotPathDelayMs?: number;
+    /** 
+     * If true, enqueue waits for Azure write confirmation before returning.
+     * Slower but guarantees durability. Default: false (fire-and-forget for performance)
+     */
+    syncAzureWrites?: boolean;
     /** Retry configuration */
     retry: {
       maxAttempts: number;

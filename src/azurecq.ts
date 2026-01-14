@@ -104,7 +104,7 @@ export class AzureCQ {
         return queueMessage;
       }
       
-      // Generate ID locally, write to Redis first, then Azure in background
+      // Generate ID locally, write to Redis first, then Azure
       const tempId = uuidv4();
       const now = new Date();
       const queueMessage: QueueMessage = {
@@ -121,11 +121,11 @@ export class AzureCQ {
         this.redis.addToHotQueue(this.config.name, queueMessage.id, Date.now())
       ]);
 
-      // Kick off Azure write asynchronously with hot path optimization
-      void (async () => {
+      // Azure write - sync or async based on configuration
+      const azureWriteTask = async (): Promise<void> => {
         try {
           // Hot path optimization: delay before Azure write to see if message gets consumed immediately
-          const hotPathDelay = this.config.settings.hotPathDelayMs || 100; // Default 100ms
+          const hotPathDelay = this.config.settings.hotPathDelayMs ?? 100; // Default 100ms
           if (hotPathDelay > 0) {
             await new Promise(resolve => setTimeout(resolve, hotPathDelay));
           }
@@ -135,7 +135,6 @@ export class AzureCQ {
           if (pendingDel) {
             await this.redis.removeCachedMessage(this.config.name, tempId);
             await this.redis.removeFromHotQueue(this.config.name, tempId);
-            //console.log(`🔥 Hot path: Message ${tempId} consumed before Azure write - skipping Azure`);
             return;
           }
 
@@ -156,20 +155,39 @@ export class AzureCQ {
           };
           
           // Atomically replace temp message with Azure message to prevent duplicates
-          const replaced = await this.redis.atomicReplaceWithAzureMessage(
+          await this.redis.atomicReplaceWithAzureMessage(
             this.config.name,
             tempId, 
             updated, 
             this.config.settings.redisCacheTtl
           );
-          
-          if (!replaced) {
-            // Temp message was already consumed during hot path - this is expected
-          }
         } catch (e) {
-          // Optionally: mark message as pending Azure failure in metadata
+          const error = e as Error;
+          console.error(`Failed to write message ${tempId} to Azure Storage:`, error.message);
+          // Mark message in Redis as pending Azure failure for potential recovery
+          try {
+            await this.redis.cacheMessage(
+              this.config.name,
+              { ...queueMessage, metadata: { ...queueMessage.metadata, _azureWriteFailed: true, _failureTime: new Date().toISOString() } },
+              this.config.settings.redisCacheTtl
+            );
+          } catch (markError) {
+            console.error('Failed to mark message as Azure write failure:', markError);
+          }
+          // Re-throw in sync mode so caller knows the write failed
+          if (this.config.settings.syncAzureWrites) {
+            throw e;
+          }
         }
-      })();
+      };
+
+      // If syncAzureWrites is enabled, wait for Azure confirmation
+      if (this.config.settings.syncAzureWrites) {
+        await azureWriteTask();
+      } else {
+        // Fire-and-forget for performance (but with proper error logging now)
+        void azureWriteTask();
+      }
 
       return queueMessage;
       
@@ -244,11 +262,11 @@ export class AzureCQ {
         this.redis.addToHotQueueBatch(this.config.name, tempMessages.map(m => m.id))
       ]);
 
-      // Fire-and-forget Azure writes with hot path optimization
-      void (async () => {
+      // Azure writes with hot path optimization - sync or async based on config
+      const azureBatchWriteTask = async (): Promise<void> => {
         try {
           // Hot path optimization: delay before Azure write
-          const hotPathDelay = this.config.settings.hotPathDelayMs || 100; // Default 100ms
+          const hotPathDelay = this.config.settings.hotPathDelayMs ?? 100; // Default 100ms
           if (hotPathDelay > 0) {
             await new Promise(resolve => setTimeout(resolve, hotPathDelay));
           }
@@ -256,7 +274,6 @@ export class AzureCQ {
           // Filter out any temp IDs already acknowledged during hot path delay
           const remaining = [] as typeof messages;
           const remainingTempIds: string[] = [];
-          let hotPathSkipped = 0;
           
           for (let i = 0; i < tempMessages.length; i++) {
             const tempId = tempMessages[i].id;
@@ -267,13 +284,8 @@ export class AzureCQ {
             } else {
               await this.redis.removeCachedMessage(this.config.name, tempId);
               await this.redis.removeFromHotQueue(this.config.name, tempId);
-              hotPathSkipped++;
             }
           }
-          
-          // if (hotPathSkipped > 0) {
-          //   console.log(`🔥 Hot path: ${hotPathSkipped}/${tempMessages.length} messages consumed before Azure write - skipping Azure`);
-          // }
           
           if (remaining.length === 0) return;
           const minShadowVisibility = 300; // 5 minutes - effectively disable Azure consumption
@@ -292,19 +304,38 @@ export class AzureCQ {
             azureMessage
           }));
           
-          const replacedCount = await this.redis.atomicBatchReplaceWithAzureMessages(
+          await this.redis.atomicBatchReplaceWithAzureMessages(
             this.config.name,
             replacements,
             this.config.settings.redisCacheTtl
           );
-          
-          // Log hot path efficiency for batch
-          // const hotPathCount = remainingTempIds.length - replacedCount;
-          // if (hotPathCount > 0) {
-          //   console.log(`🔥 Hot path: ${hotPathCount}/${remainingTempIds.length} messages consumed before Azure write - skipping Azure`);
-          // }
-        } catch {}
-      })();
+        } catch (e) {
+          const error = e as Error;
+          console.error(`Failed to write batch messages to Azure Storage:`, error.message);
+          // Mark failed messages in Redis for potential recovery
+          try {
+            for (const tempMsg of tempMessages) {
+              await this.redis.cacheMessage(
+                this.config.name,
+                { ...tempMsg, metadata: { ...tempMsg.metadata, _azureWriteFailed: true, _failureTime: new Date().toISOString() } },
+                this.config.settings.redisCacheTtl
+              );
+            }
+          } catch (markError) {
+            console.error('Failed to mark messages as Azure write failure:', markError);
+          }
+          if (this.config.settings.syncAzureWrites) {
+            throw e;
+          }
+        }
+      };
+
+      // If syncAzureWrites is enabled, wait for Azure confirmation
+      if (this.config.settings.syncAzureWrites) {
+        await azureBatchWriteTask();
+      } else {
+        void azureBatchWriteTask();
+      }
 
       return {
         messages: tempMessages,
@@ -411,7 +442,11 @@ export class AzureCQ {
               await this.redis.removeIdMapping(this.config.name, message.id);
             }
           }
-        } catch {}
+        } catch (e) {
+          // Log but don't throw - message was already removed from Redis
+          // Azure message will become visible again after visibility timeout if this fails
+          console.warn(`Failed to acknowledge message ${message.id} in Azure Storage:`, (e as Error).message);
+        }
       })();
 
       return { success: true, messageId: message.id };
@@ -467,7 +502,11 @@ export class AzureCQ {
             await this.redis.removeIdMapping(this.config.name, m.id);
           }
         }
-      } catch {}
+      } catch (e) {
+        // Log but don't throw - messages were already removed from Redis
+        // Azure messages will become visible again after visibility timeout if this fails
+        console.warn(`Failed to acknowledge batch messages in Azure Storage:`, (e as Error).message);
+      }
     })();
 
     for (const id of ids) {
@@ -708,10 +747,10 @@ export class AzureCQ {
     }
   }
 
-  // Throttle Redis status checks to once every 15 seconds
+  // Throttle Redis status checks to once every 2 seconds for faster recovery detection
   private getRedisStatusThrottled(): { isConnected: boolean; isConnecting: boolean; shouldReconnect: boolean; isHealthCheckActive: boolean; hasCustomReconnectScheduled: boolean } {
     const now = Date.now();
-    const throttleMs = 15000;
+    const throttleMs = 2000; // Reduced from 15s to 2s for faster connection state detection
     if (!this.redisStatusCache || now - this.redisStatusCache.lastCheckedMs > throttleMs) {
       const status = this.redis.getConnectionStatus();
       this.redisStatusCache = { status, lastCheckedMs: now };

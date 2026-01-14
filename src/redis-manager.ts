@@ -601,17 +601,31 @@ export class RedisManager {
     );
   }
 
+  /**
+   * Lua script for atomic get-and-delete operation
+   * Returns 1 if key existed and was deleted, 0 otherwise
+   */
+  private static readonly ATOMIC_CONSUME_SCRIPT = `
+    local key = KEYS[1]
+    local val = redis.call('GET', key)
+    if val then
+      redis.call('DEL', key)
+      return 1
+    end
+    return 0
+  `;
+
   async consumePendingDelete(queueName: string, tempId: string): Promise<boolean> {
     const key = this.getPendingDeleteKey(queueName, tempId);
     return await this.executeWithFallback(
       async () => {
-        // Emulate GETDEL for older Redis by GET then DEL
-        const val = await this.redis.get(key);
-        if (val) {
-          await this.redis.del(key);
-          return true;
-        }
-        return false;
+        // Use Lua script for atomic get-and-delete to prevent race conditions
+        const result = await this.redis.eval(
+          RedisManager.ATOMIC_CONSUME_SCRIPT,
+          1,
+          key
+        ) as number;
+        return result === 1;
       },
       false,
       'consumePendingDelete',

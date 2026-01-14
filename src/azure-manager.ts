@@ -412,6 +412,58 @@ export class AzureManager {
   }
 
   /**
+   * Peek at messages without consuming them (no visibility timeout change)
+   * Use this for read-only operations like getting queue info
+   */
+  async peekMessages(maxMessages: number = 1): Promise<QueueMessage[]> {
+    try {
+      const response = await this.queueClient.peekMessages({
+        numberOfMessages: Math.min(maxMessages, 32) // Azure limit is 32
+      });
+
+      const messages: QueueMessage[] = [];
+      
+      for (const azureMessage of response.peekedMessageItems || []) {
+        try {
+          const parsedContent = JSON.parse(azureMessage.messageText);
+          let actualContent: Buffer;
+
+          if (parsedContent.type === 'blob_reference') {
+            // For peek, we don't retrieve blob content to avoid overhead
+            // Just indicate it's a blob reference
+            actualContent = Buffer.from(`[blob:${parsedContent.blobName}]`);
+          } else if (parsedContent.type === 'inline') {
+            actualContent = Buffer.from(parsedContent.content, 'base64');
+          } else {
+            throw new Error('Unknown message type');
+          }
+
+          messages.push({
+            id: azureMessage.messageId,
+            content: actualContent,
+            metadata: parsedContent.metadata || {},
+            dequeueCount: azureMessage.dequeueCount || 0,
+            insertedOn: azureMessage.insertedOn || new Date(),
+            nextVisibleOn: new Date(), // Not available for peeked messages
+            popReceipt: undefined // Not available for peeked messages
+          });
+        } catch (parseError) {
+          console.error('Failed to parse peeked message:', parseError);
+          continue;
+        }
+      }
+
+      return messages;
+    } catch (error) {
+      throw new AzureCQError(
+        'Failed to peek messages',
+        ErrorCodes.AZURE_STORAGE_ERROR,
+        error as Error
+      );
+    }
+  }
+
+  /**
    * Create a new queue
    */
   async createQueue(queueName: string): Promise<void> {

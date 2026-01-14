@@ -14,26 +14,20 @@ export { RedisManager } from './redis-manager';
 export { AzureManager } from './azure-manager';
 export { DeadLetterManager } from './dead-letter-manager';
 
-export {
-  QueueMessage,
-  QueueMessageBatch,
-  QueueConfiguration,
-  QueueStats,
-  EnqueueOptions,
-  DequeueOptions,
-  AcknowledgmentResult,
-  BatchAcknowledgmentResult,
-  ProcessingAttempt,
-  DeadLetterQueueInfo,
-  MessageMoveResult,
-  BatchMessageMoveResult,
-  NackOptions,
-  AzureCQError,
-  ErrorCodes
-} from './types';
-
-// Re-export for convenience
+// Export all types from types module
 export * from './types';
+
+// Export performance optimizations for advanced users
+export {
+  BinaryMessageCodec,
+  AdvancedRedisOperations,
+  ObjectPool,
+  BufferPool,
+  ConcurrentBatchProcessor,
+  StreamingProcessor,
+  PerformanceMonitor,
+  PerformancePresets
+} from './performance-optimizations';
 
 
 

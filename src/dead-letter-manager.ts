@@ -160,18 +160,61 @@ export class DeadLetterManager {
   }
 
   /**
-   * Move a message from DLQ back to main queue
+   * Move a message from dead letter queue back to main queue
+   * 
+   * Note: Azure Queue Storage doesn't support fetching a specific message by ID.
+   * This method will search through visible messages in batches. For large DLQs,
+   * consider using moveAllFromDeadLetter() instead.
+   * 
+   * @param messageId - The ID of the message to move
+   * @param maxSearchBatches - Maximum number of batches to search (default: 10, each batch = 32 messages)
    */
-  async moveMessageFromDlq(messageId: string): Promise<MessageMoveResult> {
+  async moveMessageFromDlq(messageId: string, maxSearchBatches: number = 10): Promise<MessageMoveResult> {
     try {
-      // Get message from DLQ
-      const dlqMessages = await this.dlqAzure.dequeueMessages(32); // Get batch to find our message
-      const targetMessage = dlqMessages.find(msg => msg.id === messageId);
+      // Search through multiple batches to find the message
+      let targetMessage: QueueMessage | undefined;
+      let batchesSearched = 0;
+      const processedMessages: QueueMessage[] = [];
+
+      while (batchesSearched < maxSearchBatches) {
+        const dlqMessages = await this.dlqAzure.dequeueMessages(32);
+        batchesSearched++;
+        
+        if (dlqMessages.length === 0) {
+          break; // Queue is empty
+        }
+
+        for (const msg of dlqMessages) {
+          if (msg.id === messageId) {
+            targetMessage = msg;
+          } else {
+            processedMessages.push(msg);
+          }
+        }
+
+        if (targetMessage) {
+          break; // Found our message
+        }
+      }
+
+      // Re-enqueue messages that weren't our target (make them visible again immediately)
+      // This minimizes the window where other messages are invisible
+      for (const msg of processedMessages) {
+        try {
+          await this.dlqAzure.enqueueMessage(msg.content, msg.metadata, 0);
+          if (msg.popReceipt) {
+            await this.dlqAzure.acknowledgeMessage(msg.id, msg.popReceipt);
+          }
+        } catch (reEnqueueError) {
+          console.warn(`Failed to re-enqueue DLQ message ${msg.id}:`, reEnqueueError);
+          // Message will become visible again after visibility timeout expires
+        }
+      }
 
       if (!targetMessage) {
         return {
           success: false,
-          error: 'Message not found in dead letter queue',
+          error: `Message not found in dead letter queue after searching ${batchesSearched} batches (${batchesSearched * 32} messages). Message may not exist or may be temporarily invisible.`,
           messageId,
           sourceQueue: this.getDlqName(this.config.name),
           destinationQueue: this.config.name,
@@ -283,27 +326,19 @@ export class DeadLetterManager {
     try {
       const stats = await this.dlqAzure.getQueueStats();
       
-      // Get oldest and newest message timestamps by peeking messages
+      // Get oldest and newest message timestamps by peeking messages (non-destructive)
       let oldestMessage: Date | undefined;
       let newestMessage: Date | undefined;
 
       if (stats.messageCount > 0) {
         try {
-          const sampleMessages = await this.dlqAzure.dequeueMessages(10);
+          // Use peekMessages instead of dequeueMessages to avoid consuming messages
+          const sampleMessages = await this.dlqAzure.peekMessages(32);
           
           if (sampleMessages.length > 0) {
             const timestamps = sampleMessages.map(msg => msg.insertedOn);
             oldestMessage = new Date(Math.min(...timestamps.map(d => d.getTime())));
             newestMessage = new Date(Math.max(...timestamps.map(d => d.getTime())));
-
-            // Put messages back (we were just peeking)
-            for (const msg of sampleMessages) {
-              await this.dlqAzure.enqueueMessage(
-                msg.content,
-                msg.metadata,
-                0 // Immediately visible
-              );
-            }
           }
         } catch (peekError) {
           console.warn('Failed to peek DLQ messages for timestamp info:', peekError);
@@ -331,8 +366,14 @@ export class DeadLetterManager {
 
   /**
    * Purge all messages from dead letter queue
+   * 
+   * @param maxIterations - Maximum number of batch iterations to prevent infinite loops (default: 1000)
+   * @param maxConsecutiveFailures - Stop if this many consecutive acknowledgments fail (default: 10)
    */
-  async purgeDlq(): Promise<{ success: boolean; queueName: string; purgedCount?: number; error?: string }> {
+  async purgeDlq(
+    maxIterations: number = 1000,
+    maxConsecutiveFailures: number = 10
+  ): Promise<{ success: boolean; queueName: string; purgedCount?: number; skippedCount?: number; error?: string }> {
     if (!this.config.settings.deadLetter.enabled) {
       throw new AzureCQError(
         'Dead letter queue is not enabled',
@@ -341,14 +382,17 @@ export class DeadLetterManager {
     }
 
     let purgedCount = 0;
+    let skippedCount = 0;
+    let consecutiveFailures = 0;
+    let iterations = 0;
     
     try {
-      // Keep dequeuing and acknowledging until empty
-      while (true) {
+      while (iterations < maxIterations) {
+        iterations++;
         const messages = await this.dlqAzure.dequeueMessages(32);
         
         if (messages.length === 0) {
-          break;
+          break; // Queue is empty
         }
 
         // Acknowledge all messages to delete them
@@ -357,23 +401,51 @@ export class DeadLetterManager {
             try {
               await this.dlqAzure.acknowledgeMessage(message.id, message.popReceipt);
               purgedCount++;
+              consecutiveFailures = 0; // Reset on success
             } catch (ackError) {
-              console.warn('Failed to acknowledge DLQ message during purge:', ackError);
+              console.warn(`Failed to acknowledge DLQ message ${message.id} during purge:`, ackError);
+              skippedCount++;
+              consecutiveFailures++;
+              
+              if (consecutiveFailures >= maxConsecutiveFailures) {
+                return {
+                  success: false,
+                  queueName: this.getDlqName(this.config.name),
+                  purgedCount,
+                  skippedCount,
+                  error: `Stopped after ${maxConsecutiveFailures} consecutive acknowledgment failures`
+                };
+              }
             }
+          } else {
+            skippedCount++;
           }
         }
+      }
+
+      if (iterations >= maxIterations) {
+        return {
+          success: false,
+          queueName: this.getDlqName(this.config.name),
+          purgedCount,
+          skippedCount,
+          error: `Stopped after reaching maximum iterations (${maxIterations}). Queue may still contain messages.`
+        };
       }
 
       return {
         success: true,
         queueName: this.getDlqName(this.config.name),
-        purgedCount
+        purgedCount,
+        skippedCount
       };
 
     } catch (error) {
       return {
         success: false,
         queueName: this.getDlqName(this.config.name),
+        purgedCount,
+        skippedCount,
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
