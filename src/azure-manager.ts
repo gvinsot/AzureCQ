@@ -300,37 +300,67 @@ export class AzureManager {
         visibilityTimeout: visibilityTimeoutSeconds
       });
 
-      const messages: QueueMessage[] = [];
-      
-      for (const azureMessage of response.receivedMessageItems || []) {
+      const azureMessages = response.receivedMessageItems || [];
+      if (azureMessages.length === 0) {
+        return [];
+      }
+
+      // Parse all messages and identify which need blob retrieval
+      const parsedMessages: Array<{
+        azureMessage: typeof azureMessages[0];
+        parsedContent: any;
+        needsBlob: boolean;
+      }> = [];
+
+      for (const azureMessage of azureMessages) {
         try {
           const parsedContent = JSON.parse(azureMessage.messageText);
-          let actualContent: Buffer;
-
-          if (parsedContent.type === 'blob_reference') {
-            // Retrieve large message from blob
-            actualContent = await this.retrieveLargeMessageFromBlob(parsedContent.blobName);
-          } else if (parsedContent.type === 'inline') {
-            // Decode inline message
-            actualContent = Buffer.from(parsedContent.content, 'base64');
-          } else {
-            throw new Error('Unknown message type');
-          }
-
-          messages.push({
-            id: azureMessage.messageId,
-            content: actualContent,
-            metadata: parsedContent.metadata || {},
-            dequeueCount: azureMessage.dequeueCount || 0,
-            insertedOn: azureMessage.insertedOn || new Date(),
-            nextVisibleOn: azureMessage.nextVisibleOn || new Date(),
-            popReceipt: azureMessage.popReceipt
+          parsedMessages.push({
+            azureMessage,
+            parsedContent,
+            needsBlob: parsedContent.type === 'blob_reference'
           });
         } catch (parseError) {
           console.error('Failed to parse message:', parseError);
           // Skip malformed messages
-          continue;
         }
+      }
+
+      // Parallel blob retrieval for large messages (major perf improvement)
+      const blobPromises = parsedMessages
+        .filter(m => m.needsBlob)
+        .map(async m => {
+          const content = await this.retrieveLargeMessageFromBlob(m.parsedContent.blobName);
+          return { messageId: m.azureMessage.messageId, content };
+        });
+
+      const blobResults = await Promise.all(blobPromises);
+      const blobContentMap = new Map(blobResults.map(r => [r.messageId, r.content]));
+
+      // Build final messages
+      const messages: QueueMessage[] = [];
+      for (const { azureMessage, parsedContent, needsBlob } of parsedMessages) {
+        let actualContent: Buffer;
+
+        if (needsBlob) {
+          const blobContent = blobContentMap.get(azureMessage.messageId);
+          if (!blobContent) continue; // Skip if blob retrieval failed
+          actualContent = blobContent;
+        } else if (parsedContent.type === 'inline') {
+          actualContent = Buffer.from(parsedContent.content, 'base64');
+        } else {
+          continue; // Unknown type
+        }
+
+        messages.push({
+          id: azureMessage.messageId,
+          content: actualContent,
+          metadata: parsedContent.metadata || {},
+          dequeueCount: azureMessage.dequeueCount || 0,
+          insertedOn: azureMessage.insertedOn || new Date(),
+          nextVisibleOn: azureMessage.nextVisibleOn || new Date(),
+          popReceipt: azureMessage.popReceipt
+        });
       }
 
       return messages;

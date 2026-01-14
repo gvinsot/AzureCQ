@@ -50,6 +50,10 @@ export interface DequeueOptions {
   visibilityTimeout?: number;
   /** Maximum number of messages to dequeue */
   maxMessages?: number;
+  /** Block waiting for messages instead of returning immediately (seconds, 0 = no blocking) */
+  blockingTimeout?: number;
+  /** Skip Redis hot queue and go directly to Azure (useful when Redis is slow) */
+  skipRedisHotQueue?: boolean;
 }
 
 export interface QueueConfiguration {
@@ -85,6 +89,13 @@ export interface QueueConfiguration {
      * Slower but guarantees durability. Default: false (fire-and-forget for performance)
      */
     syncAzureWrites?: boolean;
+    /**
+     * Operating mode for Redis:
+     * - 'hot-cache': Redis used for hot message caching + fast dequeue (default)
+     * - 'cache-only': Redis only caches messages, no hot queue (simpler, Azure-first dequeue)
+     * - 'disabled': Redis completely disabled, Azure Queue only (simplest, most durable)
+     */
+    redisMode?: 'hot-cache' | 'cache-only' | 'disabled';
     /** Retry configuration */
     retry: {
       maxAttempts: number;

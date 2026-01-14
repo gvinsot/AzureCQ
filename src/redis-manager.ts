@@ -266,6 +266,53 @@ export class RedisManager {
   }
 
   /**
+   * Blocking dequeue from hot queue - waits for messages instead of polling
+   * Uses BZPOPMIN for efficient blocking on sorted set
+   * @param timeoutSeconds - How long to block waiting for messages (0 = forever)
+   */
+  async blockingDequeue(queueName: string, timeoutSeconds: number = 5): Promise<QueueMessage | null> {
+    return this.performanceMonitor.time('blockingDequeue', async () => {
+      return await this.executeWithFallback(
+        async () => {
+          const queueKey = this.getHotQueueKey(queueName);
+          
+          // BZPOPMIN blocks until element available or timeout
+          const result = await this.redis.bzpopmin(queueKey, timeoutSeconds);
+          
+          if (!result) {
+            return null; // Timeout - no messages
+          }
+          
+          const [, messageId] = result; // [key, member, score]
+          
+          // Retrieve the cached message
+          const cacheKey = `${this.keyPrefix}msg:${queueName}:${messageId}`;
+          const messageData = await this.redis.get(cacheKey);
+          
+          if (!messageData) {
+            return null; // Message expired from cache
+          }
+          
+          try {
+            return BinaryMessageCodec.decode(Buffer.from(messageData, 'base64'));
+          } catch {
+            // Fallback to JSON
+            const parsed = JSON.parse(messageData);
+            return {
+              ...parsed,
+              insertedOn: new Date(parsed.insertedOn),
+              nextVisibleOn: new Date(parsed.nextVisibleOn),
+            };
+          }
+        },
+        null,
+        'blockingDequeue',
+        false
+      );
+    });
+  }
+
+  /**
    * Optimized batch hot queue operations
    */
   async addToHotQueueBatch(queueName: string, messageIds: string[], priorities?: number[]): Promise<void> {

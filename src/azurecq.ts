@@ -353,8 +353,26 @@ export class AzureCQ {
 
   /**
    * Dequeue a single message
+   * @param options.blockingTimeout - If set, blocks waiting for a message (seconds)
    */
   async dequeue(options: DequeueOptions = {}): Promise<QueueMessage | null> {
+    this.ensureInitialized();
+
+    // If blocking mode requested and Redis is connected, use blocking dequeue
+    if (options.blockingTimeout && options.blockingTimeout > 0) {
+      const redisStatus = this.getRedisStatusThrottled();
+      if (redisStatus.isConnected && !options.skipRedisHotQueue) {
+        const message = await this.redis.blockingDequeue(
+          this.config.name, 
+          options.blockingTimeout
+        );
+        if (message) {
+          return message;
+        }
+        // If blocking timed out, fall through to Azure
+      }
+    }
+
     const result = await this.dequeueBatch({ ...options, maxMessages: 1 });
     return result.messages.length > 0 ? result.messages[0] : null;
   }
@@ -369,10 +387,10 @@ export class AzureCQ {
     const batchId = uuidv4();
 
     try {
-      // If Redis connected, try hot queue first; else skip to Azure
+      // If Redis connected and not skipped, try hot queue first
       let cachedMessages: QueueMessage[] = [];
       const redisStatus = this.getRedisStatusThrottled();
-      if (redisStatus.isConnected) {
+      if (redisStatus.isConnected && !options.skipRedisHotQueue) {
         cachedMessages = await this.redis.atomicBatchDequeue(this.config.name, maxMessages);
       }
 
@@ -385,15 +403,8 @@ export class AzureCQ {
           remainingCount,
           options.visibilityTimeout
         );
-
-        // Cache newly retrieved messages in Redis
-        if (azureMessages.length > 0 && redisStatus.isConnected) {
-          await this.redis.cacheMessageBatch(
-            this.config.name,
-            azureMessages,
-            this.config.settings.redisCacheTtl
-          );
-        }
+        // Note: No re-caching to Redis - these messages are already dequeued
+        // and will be processed immediately. Re-caching would be wasteful.
       }
 
       const allMessages = [...cachedMessages, ...azureMessages];
