@@ -12,7 +12,7 @@ This document explains how to run AzureCQ with Docker Compose, including Redis, 
 To run the performance test with all required services:
 
 ```bash
-docker-compose up
+docker-compose up --build
 ```
 
 This will:
